@@ -1,0 +1,6 @@
+torch
+numpy
+pillow
+requests
+aiohttp
+boto3
