@@ -1,0 +1,14 @@
+[project]
+name = "comfyui-boorubrowser"
+description = "Quickly search and get images from Gelbooru/Danbooru/E621 without leaving ComfyUI"
+version = "1.0.0"
+license = { file = "LICENSE.md" }
+
+[project.urls]
+Repository = "https://github.com/GreenLandisaLie/ComfyUI-BooruBrowser"
+#  Used by Comfy Registry https://comfyregistry.org
+
+[tool.comfy]
+PublisherId = "greenlandisalie"
+DisplayName = "ComfyUI-BooruBrowser"
+Icon = ""
