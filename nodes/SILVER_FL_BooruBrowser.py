@@ -239,12 +239,8 @@ async def api_booru_search(request):
             # Danbooru uses space-separated tags, with `-` prefix for exclusion
             tag_query.extend(AND_tags)
             if OR_tags:
-                if len(OR_tags) > 1:
-                    # Danbooru supports “(a or b)” syntax with ~?
-                    # Actually Danbooru uses `a~b` for OR (tilde), so we convert OR_tags accordingly
-                    tag_query.append("(" + "~".join(OR_tags) + ")")
-                else:
-                    tag_query.append(OR_tags[0])
+                # Each OR tag must be prefixed with "~"
+                tag_query.extend([f"~{t}" for t in OR_tags])
             if exclude_tags:
                 tag_query.extend(["-" + t for t in exclude_tags])
         
