@@ -6,3 +6,13 @@ Created with the help of ChatGPT and Gemini
 
 UI based on the FL Load Image node (highly recommended) from https://github.com/filliptm/ComfyUI_Fill-Nodes
 
+# Changelog:
+
+- v2.1.0
+	- Fixed OR_tags not working on Danbooru
+
+- v2.0.0
+	- Added 'select_random_result' feature
+
+- v1.0.0
+	- Initial release
