@@ -1,5 +1,6 @@
 import re
 import requests
+import random
 import io
 import json
 import os
@@ -14,6 +15,8 @@ from server import PromptServer
 
 USER_AGENT = "ComfyUI-BooruBrowser/1.0"
 
+CURRENT_URLS = []
+RANDOMLY_SELECTED_URL = ""
 
 def loadImageFromUrl(url):
     if url.startswith("data:image/"):
@@ -69,6 +72,7 @@ class SILVER_FL_BooruBrowser:
                 "Questionable": ("BOOLEAN", {"default": True}),
                 "Explicit": ("BOOLEAN", {"default": True}),
                 "Order": (["Date","Score"], {}),
+                "select_random_result": ("BOOLEAN", {"default": False}),
                 "thumbnail_size": ("INT", {"default": 240, "min": 80, "max": 1024}),
                 "gelbooru_user_id": ("STRING", {"default": ""}),
                 "gelbooru_api_key": ("STRING", {"default": ""}),
@@ -96,17 +100,18 @@ Notes:
     - 'AND_tags' , 'OR_tags' and 'exclude_tags' are single line comma separated booru tags
     - user_id for Danbooru/E621 is actually your login id
     - Searching on Danbooru is mostly useless unless you have a Gold account (you are limited to 2 tags)
+    - 'select_random_result' will return a random image from the current results (ignores current selection). You should set limit to 50 or even 100 when using this feature.
 """
 
-    def browse_booru(self, site, AND_tags, OR_tags, exclude_tags, limit, page, Safe, Questionable, Explicit, Order, thumbnail_size,
+    def browse_booru(self, site, AND_tags, OR_tags, exclude_tags, limit, page, Safe, Questionable, Explicit, Order, select_random_result, thumbnail_size,
         gelbooru_user_id, gelbooru_api_key, danbooru_user_id, danbooru_api_key, e621_user_id, e621_api_key, 
         selected_url="", selected_img_tags=""):
         
-        if not selected_url:
+        if not selected_url or (select_random_result and RANDOMLY_SELECTED_URL == ""):
             return (torch.zeros(1,1,1,3), "")
             
         try:
-            img, mask = loadImageFromUrl(selected_url)
+            img, mask = loadImageFromUrl(selected_url if not select_random_result else RANDOMLY_SELECTED_URL)
             img_tags = ", ".join([tag.strip() for tag in selected_img_tags.lower().replace(',', ' ').split(' ') if tag.strip() != ''])
             return (img, img_tags)
         except Exception as e:
@@ -114,14 +119,22 @@ Notes:
             return (torch.zeros(1,1,1,3), "")
 
     @classmethod
-    def IS_CHANGED(cls, site, AND_tags, OR_tags, exclude_tags, limit, page, Safe, Questionable, Explicit, Order, thumbnail_size,
+    def IS_CHANGED(cls, site, AND_tags, OR_tags, exclude_tags, limit, page, Safe, Questionable, Explicit, Order, select_random_result, thumbnail_size,
         gelbooru_user_id, gelbooru_api_key, danbooru_user_id, danbooru_api_key, e621_user_id, e621_api_key, 
         selected_url="", selected_img_tags=""):
-        # Node is considered changed when a thumbnail selection modifies selected_url
-        return selected_url
+        # Node is considered changed when a thumbnail selection modifies selected_url OR when select_random_result is True
+        # comfyUI assumes the node is changed when the output of this function is different than the last time it ran
+        # so we need to retrieve the random url from here when select_random_result and might as well turn it empty string here as well when not select_random_result
+        if select_random_result:
+            global RANDOMLY_SELECTED_URL
+            RANDOMLY_SELECTED_URL = random.choice(CURRENT_URLS)
+            return RANDOMLY_SELECTED_URL
+        else:
+            RANDOMLY_SELECTED_URL = ""
+            return selected_url
 
     @classmethod
-    def VALIDATE_INPUTS(cls, site, AND_tags, OR_tags, exclude_tags, limit, page, Safe, Questionable, Explicit, Order, thumbnail_size,
+    def VALIDATE_INPUTS(cls, site, AND_tags, OR_tags, exclude_tags, limit, page, Safe, Questionable, Explicit, Order, select_random_result, thumbnail_size,
         gelbooru_user_id, gelbooru_api_key, danbooru_user_id, danbooru_api_key, e621_user_id, e621_api_key, 
         selected_url="", selected_img_tags=""):
         
@@ -165,6 +178,7 @@ async def api_booru_search(request):
     }
     Returns: JSON { "posts": [ {id, file_url, preview_url, tags, width, height, source} ... ] }
     """
+    global CURRENT_URLS
     try:
         data = await request.json()
         
@@ -325,6 +339,8 @@ async def api_booru_search(request):
         #print(f"[SILVER_FL_BooruBrowser] url: {url}")
         #print(f"[SILVER_FL_BooruBrowser] params: {params}")
         
+        CURRENT_URLS.clear()
+        
         out_posts = []
         for post in posts:
             id = "" # optional
@@ -364,6 +380,7 @@ async def api_booru_search(request):
             #print(f"[SILVER_FL_BooruBrowser] file_url: {file_url}")
             
             if file_url and preview_url and tags:
+                CURRENT_URLS.append(file_url)
                 out_posts.append({
                     "id": id,
                     "file_url": file_url,
@@ -385,8 +402,8 @@ async def api_booru_search(request):
 @PromptServer.instance.routes.post("/silver_fl_booru/thumb")
 async def api_booru_thumb(request):
     """
-    Request JSON body: { "url": "<image url>", "size": 80 }
-    Returns PNG thumbnail bytes (image/png)
+    Request JSON body: { "url": "<image url>", "size": int, "site": string, "user_id": string, "api_key": string }
+    Returns JPEG thumbnail bytes (image/jpeg)
     """
     try:
         data = await request.json()
@@ -407,7 +424,7 @@ async def api_booru_thumb(request):
         resp = requests.get(url, timeout=8, stream=True, headers=headers)
         resp.raise_for_status()
         
-        #img = Image.open(io.BytesIO(resp.content))
+        #img = Image.open(io.BytesIO(resp.content)) # this is slower
         img = Image.open(resp.raw)
         
         img = ImageOps.exif_transpose(img)
