@@ -42,8 +42,8 @@ function addBooruBrowserUI(node) {
 
     // UI sizing constants
 	const MIN_WIDTH = 500;
-    const MIN_HEIGHT = 845;
-    const TOP_PADDING = 580;
+    const MIN_HEIGHT = 875;
+    const TOP_PADDING = 610;
     const INPUT_SPACING = 6;
 	const THUMB_SIZE = thumbnailSizeWidget ? thumbnailSizeWidget.value : 240;
     const THUMB_PADDING = 8;
@@ -411,3 +411,4 @@ function addBooruBrowserUI(node) {
     // initial search on node creation? we won't auto-search; user must press Search
     node.setDirtyCanvas(true);
 }
+
