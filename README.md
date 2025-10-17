@@ -8,6 +8,9 @@ UI based on the FL Load Image node (highly recommended) from https://github.com/
 
 # Changelog:
 
+- v2.2.0
+	- Added thumbnail_quality feature
+
 - v2.1.0
 	- Fixed OR_tags not working on Danbooru
 
