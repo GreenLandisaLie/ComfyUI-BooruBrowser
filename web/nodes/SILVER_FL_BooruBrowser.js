@@ -22,6 +22,7 @@ function addBooruBrowserUI(node) {
     const explicitWidget = node.widgets.find(w => w.name === "Explicit");
 	const orderWidget = node.widgets.find(w => w.name === "Order");
 	const thumbnailSizeWidget = node.widgets.find(w => w.name === "thumbnail_size");
+	const thumbnailQualityWidget = node.widgets.find(w => w.name === "thumbnail_quality");
 	
     const gelbooru_userWidget = node.widgets.find(w => w.name === "gelbooru_user_id");
     const gelbooru_apiWidget = node.widgets.find(w => w.name === "gelbooru_api_key");
@@ -324,6 +325,7 @@ function addBooruBrowserUI(node) {
             Questionable: questionableWidget ? questionableWidget.value : true,
             Explicit: explicitWidget ? explicitWidget.value : true,
 			Order: orderWidget ? orderWidget.value : "Date",
+			thumbnail_quality: thumbnailQualityWidget ? thumbnailQualityWidget.value : "Low",
             gelbooru_user_id: gelbooru_userWidget ? gelbooru_userWidget.value : "",
             gelbooru_api_key: gelbooru_apiWidget ? gelbooru_apiWidget.value : "",
 			danbooru_user_id: danbooru_userWidget ? danbooru_userWidget.value : "",
@@ -353,6 +355,7 @@ function addBooruBrowserUI(node) {
             node.setDirtyCanvas(true);
 			
 			const currentThumbSize = thumbnailSizeWidget ? thumbnailSizeWidget.value : THUMB_SIZE; 
+			const thumbQuality = thumbnailQualityWidget ? thumbnailQualityWidget.value : "Low"; 
 			
 			// load thumbnail bitmaps (concurrently, but limited)
             // Use preview_url if provided by backend; backend returns preview_url in 'preview_url' but we used 'file_url' name.
@@ -363,7 +366,7 @@ function addBooruBrowserUI(node) {
                     const tResp = await fetch("/silver_fl_booru/thumb", {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ url: thumbUrl, size: currentThumbSize - 4, site: p.site, user_id: p.user_id, api_key: p.api_key })
+                        body: JSON.stringify({ url: thumbUrl, size: currentThumbSize - 4, thumbnail_quality: thumbQuality, site: p.site, user_id: p.user_id, api_key: p.api_key })
                     });
                     if (tResp.ok) {
                         const blob = await tResp.blob();
