@@ -8,6 +8,9 @@ UI based on the FL Load Image node (highly recommended) from https://github.com/
 
 # Changelog:
 
+- v2.2.1
+	- Fixed padding for extra thumbnail_quality option
+
 - v2.2.0
 	- Added thumbnail_quality feature
 
