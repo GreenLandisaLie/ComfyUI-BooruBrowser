@@ -360,7 +360,7 @@ async def api_booru_search(request):
                 id = str(post.get("id", ""))
                 source = post.get("sources", [None])[0] if post.get("sources") else ""
                 file_url = post.get("file", {}).get("url", "") or source
-                preview_url = ( (post.get("sample", {}).get("url", "") or post.get("preview", {}).get("url", "")) if thumbnail_quality == "High" else post.get("preview", {}).get("url", "") ) or file_url
+                preview_url = ( (post.get("sample", {}).get("url", "") or post.get("preview", {}).get("url", "")) if thumbnail_quality == "High" else (post.get("preview", {}).get("url", "") or post.get("sample", {}).get("url", "")) ) or file_url
                 # Tags in E621 are grouped by category (general, species, etc.)
                 tag_groups = post.get("tags", {})
                 all_tags = []
@@ -479,6 +479,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SILVER_FL_BooruBrowser": "[Silver] Booru Browser",
 }
+
 
 
 
