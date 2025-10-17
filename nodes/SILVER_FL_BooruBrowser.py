@@ -74,6 +74,7 @@ class SILVER_FL_BooruBrowser:
                 "Order": (["Date","Score"], {}),
                 "select_random_result": ("BOOLEAN", {"default": False}),
                 "thumbnail_size": ("INT", {"default": 240, "min": 80, "max": 1024}),
+                "thumbnail_quality": (["Low","Normal","High"], {}),
                 "gelbooru_user_id": ("STRING", {"default": ""}),
                 "gelbooru_api_key": ("STRING", {"default": ""}),
                 "danbooru_user_id": ("STRING", {"default": ""}),
@@ -103,7 +104,7 @@ Notes:
     - 'select_random_result' will return a random image from the current results (ignores current selection). You should set limit to 50 or even 100 when using this feature.
 """
 
-    def browse_booru(self, site, AND_tags, OR_tags, exclude_tags, limit, page, Safe, Questionable, Explicit, Order, select_random_result, thumbnail_size,
+    def browse_booru(self, site, AND_tags, OR_tags, exclude_tags, limit, page, Safe, Questionable, Explicit, Order, select_random_result, thumbnail_size, thumbnail_quality,
         gelbooru_user_id, gelbooru_api_key, danbooru_user_id, danbooru_api_key, e621_user_id, e621_api_key, 
         selected_url="", selected_img_tags=""):
         
@@ -119,7 +120,7 @@ Notes:
             return (torch.zeros(1,1,1,3), "")
 
     @classmethod
-    def IS_CHANGED(cls, site, AND_tags, OR_tags, exclude_tags, limit, page, Safe, Questionable, Explicit, Order, select_random_result, thumbnail_size,
+    def IS_CHANGED(cls, site, AND_tags, OR_tags, exclude_tags, limit, page, Safe, Questionable, Explicit, Order, select_random_result, thumbnail_size, thumbnail_quality,
         gelbooru_user_id, gelbooru_api_key, danbooru_user_id, danbooru_api_key, e621_user_id, e621_api_key, 
         selected_url="", selected_img_tags=""):
         # Node is considered changed when a thumbnail selection modifies selected_url OR when select_random_result is True
@@ -134,7 +135,7 @@ Notes:
             return selected_url
 
     @classmethod
-    def VALIDATE_INPUTS(cls, site, AND_tags, OR_tags, exclude_tags, limit, page, Safe, Questionable, Explicit, Order, select_random_result, thumbnail_size,
+    def VALIDATE_INPUTS(cls, site, AND_tags, OR_tags, exclude_tags, limit, page, Safe, Questionable, Explicit, Order, select_random_result, thumbnail_size, thumbnail_quality,
         gelbooru_user_id, gelbooru_api_key, danbooru_user_id, danbooru_api_key, e621_user_id, e621_api_key, 
         selected_url="", selected_img_tags=""):
         
@@ -169,6 +170,7 @@ async def api_booru_search(request):
       "Questionable": bool,
       "Explicit": bool,
       "Order": "Date" or "Score",
+      "thumbnail_quality": "Low" or "Normal" or "High",
       "gelbooru_user_id": "",
       "gelbooru_api_key": "",
       "danbooru_user_id": "",
@@ -192,6 +194,7 @@ async def api_booru_search(request):
         Questionable = bool(data.get("Questionable", True))
         Explicit = bool(data.get("Explicit", True))
         Order = data.get("Order", "Date")
+        thumbnail_quality = data.get("thumbnail_quality", "Low")
         
         gelbooru_user_id = data.get("gelbooru_user_id", "")
         gelbooru_api_key = data.get("gelbooru_api_key", "")
@@ -334,6 +337,7 @@ async def api_booru_search(request):
         
         #print(f"[SILVER_FL_BooruBrowser] url: {url}")
         #print(f"[SILVER_FL_BooruBrowser] params: {params}")
+        #print(f"[SILVER_FL_BooruBrowser] posts: {posts}")
         
         CURRENT_URLS.clear()
         
@@ -349,14 +353,14 @@ async def api_booru_search(request):
                 id = post.get("id", "")
                 source = post.get("source", "")
                 file_url = post.get("file_url", "") or source # when file_url is not available use source instead
-                preview_url = post.get("preview_url", "") or post.get("sample_url", "") or file_url # as a last resort: set it to file_url
+                preview_url = ( (post.get("sample_url", "") or post.get("preview_url", "")) if thumbnail_quality == "High" else (post.get("preview_url", "") or post.get("sample_url", "")) ) or file_url # as a last resort: set it to file_url
                 tags = post.get("tags", "")
             
             elif site == "E621":
                 id = str(post.get("id", ""))
                 source = post.get("sources", [None])[0] if post.get("sources") else ""
                 file_url = post.get("file", {}).get("url", "") or source
-                preview_url = post.get("preview", {}).get("url", "") or file_url
+                preview_url = ( (post.get("sample", {}).get("url", "")) if thumbnail_quality == "High" else (post.get("preview", {}).get("url", "")) ) or file_url
                 # Tags in E621 are grouped by category (general, species, etc.)
                 tag_groups = post.get("tags", {})
                 all_tags = []
@@ -368,9 +372,29 @@ async def api_booru_search(request):
                 id = str(post.get("id", ""))
                 source = post.get("source", "")
                 # Danbooru returns fields like file_url, large_file_url, preview_file_url
-                file_url = post.get("large_file_url") or post.get("file_url") or source
-                preview_url = post.get("preview_file_url") # non-Gold users won't get a 'preview_file_url' for gold-exclusive files - so we take advantage of that and don't fallback to file_url here
-                tags = post.get("tag_string", "")  # Danbooru’s tag string
+                file_url = post.get("large_file_url", "") or post.get("file_url", "") or source
+                preview_url = post.get("preview_file_url", "") # non-Gold users won't get a 'preview_file_url' for gold-exclusive files - so we take advantage of that and don't fallback to file_url here
+                tags = post.get("tag_string", "")  # Danbooru’s tag string                
+                
+                # --- Danbooru preview_url selection with thumbnail_quality support ---
+                if preview_url and thumbnail_quality != "Low":
+                    # safe extraction of danbooru variants (handles missing / malformed media_asset)
+                    media_asset = post.get("media_asset")
+                    if isinstance(media_asset, dict):
+                        variants = media_asset.get("variants") if isinstance(media_asset.get("variants"), list) else []
+                    else:
+                        variants = []
+                    
+                    variant_map = {}
+                    for v in variants:
+                        if isinstance(v, dict):
+                            t = v.get("type")
+                            u = v.get("url")
+                            if t and u:
+                                variant_map[t] = u
+                    
+                    preview_url = ( (variant_map.get("720x720") or variant_map.get("360x360")) if thumbnail_quality == "High" else variant_map.get("360x360") ) or preview_url
+            
             
             #print(f"[SILVER_FL_BooruBrowser] preview_url: {preview_url}")
             #print(f"[SILVER_FL_BooruBrowser] file_url: {file_url}")
@@ -398,14 +422,15 @@ async def api_booru_search(request):
 @PromptServer.instance.routes.post("/silver_fl_booru/thumb")
 async def api_booru_thumb(request):
     """
-    Request JSON body: { "url": "<image url>", "size": int, "site": string, "user_id": string, "api_key": string }
-    Returns JPEG thumbnail bytes (image/jpeg)
+    Request JSON body: { "url": "<image url>", "size": int, "thumbnail_quality": string, "site": string, "user_id": string, "api_key": string }
+    Returns JPEG thumbnail bytes (image/jpeg) OR PNG thumbnail bytes (image/png)
     """
     try:
         data = await request.json()
         
         url = data.get("url", "")
         size = int(data.get("size", 240))
+        thumbnail_quality = data.get("thumbnail_quality", "Low")
         
         # in case its necessary to parse the url or add cookies with these
         site = data.get("site", "")    
@@ -423,13 +448,19 @@ async def api_booru_thumb(request):
         #img = Image.open(io.BytesIO(resp.content)) # this is slower
         img = Image.open(resp.raw)
         
+        format = "PNG" if thumbnail_quality == "High" else "JPEG"
+        params = {}
+        
+        if format == "JPEG":
+            params["quality"] = 95 if thumbnail_quality == "Normal" else 85
+        
         img = ImageOps.exif_transpose(img)
         img.thumbnail((size, size))
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=85)
+        img.save(buf, format=format, **params)
         buf.seek(0)
         
-        return web.Response(body=buf.read(), content_type='image/jpeg')
+        return web.Response(body=buf.read(), content_type = 'image/png' if format == "PNG" else 'image/jpeg')
     except Exception as e:
         print("[SILVER_FL_BooruBrowser] /thumb error:", e)
         return web.json_response({"error": str(e)}, status=500)
