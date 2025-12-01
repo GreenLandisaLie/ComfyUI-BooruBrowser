@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-boorubrowser"
 description = "Quickly search and get images from Gelbooru/Danbooru/E621 without leaving ComfyUI"
-version = "3.0.0"
+version = "3.0.1"
 license = { file = "LICENSE.md" }
 
 [project.urls]
