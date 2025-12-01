@@ -4,3 +4,4 @@ pillow
 requests
 aiohttp
 boto3
+opencv-python
