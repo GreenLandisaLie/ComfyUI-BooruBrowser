@@ -7,6 +7,9 @@ Created with the help of ChatGPT and Gemini
 UI based on the FL Load Image node (highly recommended) from https://github.com/filliptm/ComfyUI_Fill-Nodes
 
 # Changelog:
+- v3.0.1
+	- Fixed missing 'opencv-python' from requirements.txt
+
 - v3.0.0
 	- Added support for videos:
  		- Videos can be displayed at full resolution within the thumbnail's squares. You can also open them in fullscreen mode.
