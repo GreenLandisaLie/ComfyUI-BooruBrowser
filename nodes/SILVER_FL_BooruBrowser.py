@@ -1,15 +1,25 @@
 import re
 import requests
+import math
 import random
 import io
 import json
 import os
+import subprocess
+import tempfile
+import shutil
+import uuid
 from PIL import Image, ImageOps
+from typing import Optional, Dict, Any
 import torch
 import numpy as np
+import cv2
+import aiohttp
 from aiohttp import web
+import asyncio
 import boto3
 import comfy
+import folder_paths
 from server import PromptServer
 
 
@@ -17,6 +27,418 @@ USER_AGENT = "ComfyUI-BooruBrowser/1.0"
 
 CURRENT_URLS = []
 RANDOMLY_SELECTED_URL = ""
+
+
+# ----- VIDEO UTILS ------
+TEMP_FOLDER = folder_paths.get_temp_directory()
+os.makedirs(TEMP_FOLDER, exist_ok=True)
+
+def check_ffmpeg():
+    """
+    Checks if the 'ffmpeg' executable is installed and available in PATH.
+    """
+    # 1. Check using shutil.which (Most efficient)
+    if shutil.which("ffmpeg"):
+        return True
+    
+    # 2. Check using subprocess (Fallback, ensures it's executable)
+    try:
+        # Run a minimal command, suppress output, check only the return code
+        # The 'shell=True' option is generally avoided, so we execute directly.
+        subprocess.run(
+            ['ffmpeg', '-version'], 
+            check=True,                 # Raise CalledProcessError for non-zero return codes
+            stdout=subprocess.PIPE,     # Don't print stdout to console
+            stderr=subprocess.PIPE,     # Don't print stderr to console
+            text=True                   # Decode output as text
+        )
+        return True
+    except FileNotFoundError:
+        # This exception is raised if the executable 'ffmpeg' cannot be found in PATH.
+        return False
+    except subprocess.CalledProcessError:
+        # This exception is raised if the command runs but returns a non-zero exit code
+        # (e.g., if there's a problem with the FFMPEG installation or environment, 
+        # though '-version' rarely fails).
+        return True # The command ran, so FFMPEG is technically installed.
+    except Exception:
+        # Catch any other unexpected errors
+        return False
+
+FFMPEG_available = check_ffmpeg()
+
+def run_ffprobe_on_bytes(data: bytes) -> Optional[dict]:
+    """Runs ffprobe on byte data fed via stdin and returns JSON metadata."""
+    try:
+        proc = subprocess.Popen(
+            [
+                "ffprobe", "-v", "error",
+                "-print_format", "json",
+                "-show_format",
+                "-show_streams",
+                "pipe:0"
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        out, err = proc.communicate(input=data, timeout=5)
+
+        if proc.returncode != 0:
+            return None
+        
+        return json.loads(out.decode("utf-8"))
+    except Exception as e:
+        print(f"Failed to probe video: {e}")
+        return None
+
+def probe_video(file_url):
+    head = requests.head(file_url)
+    if "Content-Length" not in head.headers:
+        #print("Server did not provide Content-Length; abort.")
+        return None
+    
+    MOOV_PROBE_SIZE = 1024 * 1024 * 1  # 1 MB from start & end
+    content_length = int(head.headers["Content-Length"])
+    ranges = [
+        f"bytes=0-{MOOV_PROBE_SIZE - 1}",
+        f"bytes={max(content_length - MOOV_PROBE_SIZE, 0)}-{content_length - 1}"
+    ]
+    
+    probe_data = bytearray()
+    for r in ranges:
+        resp = requests.get(file_url, headers={"Range": r}, stream=True)
+        if resp.status_code not in (200, 206):
+            print(f"Failed to fetch probe range {r}")
+            return None
+        for chunk in resp.iter_content(chunk_size=64 * 1024):
+            probe_data.extend(chunk)
+    
+    metadata = run_ffprobe_on_bytes(bytes(probe_data))
+    if not metadata:
+        #print("FFprobe could not parse metadata.")
+        return None
+    return metadata
+
+def get_video_duration_and_rotation(file_url):
+    duration_ms = 0
+    rotation = 0
+    
+    if not file_url or not FFMPEG_available:
+        return duration_ms, rotation
+    
+    metadata = probe_video(file_url)
+    if metadata:
+        # === Duration parser ===
+        if "format" in metadata and "duration" in metadata["format"]:
+            try:
+                duration_ms = int(float(metadata["format"]["duration"]) * 1000)
+            except:
+                pass
+        if duration_ms == 0 and "streams" in metadata:
+            for stream in metadata["streams"]:
+                if "duration" in stream and float(stream["duration"]) > 0:
+                    duration_ms = int(float(stream["duration"]) * 1000)
+                    break
+        
+        # === Rotation parser ===
+        # 1. Check simple rotation tags ("rotate" or "rotation")
+        if "streams" in metadata and len(metadata["streams"]) > 0:
+            first_stream = metadata["streams"][0]
+            tags = first_stream.get("tags", {})
+            for key in ("rotate", "rotation"):
+                if key in tags:
+                    try:
+                        angle = int(tags[key])
+                        rotation = abs(angle) % 360
+                        break
+                    except:
+                        pass
+            
+            if rotation == 0:
+                # 2. Check side_data_list for rotation or rotate fields
+                sdl = first_stream.get("side_data_list", [])
+                for sd in sdl:
+                    if "rotation" in sd:
+                        try:
+                            rotation = abs(int(sd["rotation"])) % 360
+                            break
+                        except:
+                            pass
+                    if "rotate" in sd:
+                        try:
+                            rotation = abs(int(sd["rotate"])) % 360
+                            break
+                        except:
+                            pass
+                    
+                    if rotation == 0:
+                        # 3. Check displaymatrix
+                        if "displaymatrix" in sd:
+                            text = str(sd["displaymatrix"])
+                            m = re.search(r'(-?\d+)', text)
+                            if m:
+                                try:
+                                    return abs(int(m.group(1))) % 360
+                                except:
+                                    pass
+    
+    return duration_ms, rotation
+
+def isVideo(file_url):
+    return (
+        file_url.endswith(".gif") or
+        file_url.endswith(".gifv") or
+        file_url.endswith(".webm") or
+        file_url.endswith(".mp4") or
+        file_url.endswith(".m4v") or
+        file_url.endswith(".mov") or
+        file_url.endswith(".ogv")
+    )
+
+def download_temp_clip(file_url: str, extract_time_start_ms: int, extract_duration_range_ms: int) -> Optional[str]:
+    start_time_seconds = extract_time_start_ms / 1000.0
+    duration_seconds = extract_duration_range_ms / 1000.0
+
+    temp_file_path = os.path.join(TEMP_FOLDER, f"temp_clip_{uuid.uuid4()}.mp4")
+    
+    ffmpeg_command = [
+        'ffmpeg',
+        '-y',               # Overwrite output file
+        '-i', file_url,
+        '-ss', str(start_time_seconds),
+        '-t', str(duration_seconds),
+        '-an',              # No audio
+        '-c:v', 'libx264',  # Re-encode video stream
+        '-preset', 'fast',  # Balance between speed and compression (e.g., 'veryfast', 'medium')
+        '-crf', '18',       # Constant Rate Factor: 0=lossless, 51=worst quality. 23 is a good default.
+        '-f', 'mp4',        # Output format
+        temp_file_path
+    ]
+    
+    try:
+        process = subprocess.run(
+            ffmpeg_command,
+            check=True,  # Raise an exception for non-zero return codes
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        return temp_file_path
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        os.unlink(temp_file_path)
+        return None
+
+def download_temp_gif(file_url):
+    try:
+        #ext = ".gifv" if file_url.endswith(".gifv") else ".gif"
+        ext = ".gif"
+        temp_file_path = os.path.join(TEMP_FOLDER, f"temp_gif_{uuid.uuid4()}{ext}")
+        response = requests.get(file_url, stream=True)
+        response.raise_for_status()
+        with open(temp_file_path, 'wb') as temp_file:
+            for chunk in response.iter_content(chunk_size=8192):
+                temp_file.write(chunk)
+        return temp_file_path
+    except:
+        return None
+
+def convert_gif_to_mp4(gif_path):
+    try:
+        mp4_path = os.path.join(TEMP_FOLDER, f"converted_video_{uuid.uuid4()}.mp4")
+        ffmpeg_command = [
+            'ffmpeg',
+            '-i', gif_path,
+            '-c:v', 'libx264',
+            '-pix_fmt', 'yuv420p',
+            '-movflags', 'faststart',
+            '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+            '-crf', '18',
+            mp4_path
+        ]
+        subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True)
+        os.unlink(gif_path)
+        return mp4_path
+    except Exception as e:
+        print(f"An unexpected error occurred during GIF to MP4 conversion: {e}")
+        if os.path.exists(mp4_path):
+            os.unlink(mp4_path)
+        return None
+
+def select_single_frame(file_url, extract_time_start_ms):
+    t = torch.zeros(1,1,1,3)
+
+    is_gif = file_url.endswith(".gif")# or file_url.endswith(".gifv")
+    if is_gif:
+        file_url = download_temp_gif(file_url)
+        try:
+            img = Image.open(file_url)
+            # Calculate the target frame index
+            # GIFs usually run at a fixed frame delay (often 100ms), 
+            # but the best way is to accumulate delays.
+            # We'll approximate the index by iterating and summing frame durations
+            current_duration_ms = 0
+            target_index = 0
+            while current_duration_ms < extract_time_start_ms:
+                # Get the frame's specific duration (delay)
+                # GIF frame delay is in centiseconds (1/100th of a second), so multiply by 10
+                delay_ms = img.info.get('duration', 100) * 10
+                # Move to the next frame
+                try:
+                    img.seek(target_index + 1)
+                    current_duration_ms += delay_ms
+                    target_index += 1
+                except EOFError:
+                    # Reached the end of the animation
+                    break
+            img.seek(max(0, target_index - 1)) # Seek back to the identified target frame. Use the last successful index
+            t = torch.from_numpy(np.array(img.convert("RGB"), np.float32) / 255.0)  # H,W,C
+            t = t.unsqueeze(0)
+        except Exception as e:
+            print(f"Error parsing gif: {e}")
+        finally:
+            if img:
+                img.close()
+            if file_url:
+                os.unlink(file_url)
+        return t
+    
+    cmd = [
+        "ffmpeg",
+        "-ss", f"{extract_time_start_ms / 1000.0}",
+        "-i", file_url,
+        "-copyts",
+        "-vframes", "1",
+        "-f", "image2pipe",
+        "-vcodec", "png",
+        "-"
+    ]
+    
+    try:
+        # Run the command and capture the raw PNG data from stdout
+        raw_img_png_buffer = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+        np_buffer = np.frombuffer(raw_img_png_buffer, np.uint8)
+        image = cv2.imdecode(np_buffer, cv2.IMREAD_COLOR) # Decode the PNG format into a BGR image array (H, W, 3)
+        if image is not None:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            t = torch.from_numpy(image.astype(np.float32) / 255.0)  # H,W,C
+            t = t.unsqueeze(0) # (1, H, W, C)
+    except Exception as e:
+        print(f"Error during image decoding/tensor conversion: {e}")
+    
+    return t
+
+def extract_video_frames(file_url, extract_time_start_ms, extract_duration_range_ms, extract_N_frames, frame_max_width, frame_max_height):
+    t = torch.zeros(1,1,1,3)
+    
+    is_gif = file_url.endswith(".gif")# or file_url.endswith(".gifv")
+    if is_gif:
+        tmp_clip_path = download_temp_gif(file_url)
+        try:
+            tmp_clip_path = convert_gif_to_mp4(tmp_clip_path)
+        except:
+            print(f"Failed to parse gif from url: {file_url}")
+            if tmp_clip_path:
+                os.unlink(tmp_clip_path)
+            return t
+    else:
+        tmp_clip_path = download_temp_clip(file_url, extract_time_start_ms, extract_duration_range_ms)
+    
+    if not tmp_clip_path:
+        return t
+    
+    cap = cv2.VideoCapture(tmp_clip_path)
+    if not cap.isOpened():
+        os.unlink(tmp_clip_path)
+        print("Failed to open temporary clipped video with OpenCV")
+        return t
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total_frames <= 0:
+        cap.release()
+        os.unlink(tmp_clip_path)
+        print("Clipped video has no frames")
+        return t
+        
+    _, required_rotation = get_video_duration_and_rotation(file_url)
+    
+    if extract_N_frames == 1:
+        target_idxs = [0]
+    else:
+        target_idxs = [
+            int(round(i * (total_frames - 1) / (extract_N_frames - 1)))
+            for i in range(extract_N_frames)
+        ]
+
+    frames = []
+    dimensions_checked = False
+    new_width = 0
+    new_height = 0
+    for idx in target_idxs:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+
+        # Resize while keeping aspect ratio
+        if not dimensions_checked and ret and frame is not None:
+            dimensions_checked = True
+            (original_height, original_width) = frame.shape[:2]
+            width_ratio = frame_max_width / original_width
+            height_ratio = frame_max_height / original_height
+            scale_factor = min(width_ratio, height_ratio)
+            if scale_factor < 1.0:
+                new_width = int(original_width * scale_factor) - (int(original_width * scale_factor) % 2) # ensure divisible by 2
+                new_height = int(original_height * scale_factor) - (int(original_height * scale_factor) % 2) # ensure divisible by 2
+        
+        if not ret or frame is None:
+            if dimensions_checked and new_width != 0:
+                # Fallback black frame with *correct* determined size (H, W, C)
+                black_frame = torch.zeros(new_height, new_width, 3).unsqueeze(0)
+                frames.append(black_frame)
+            else:
+                pass 
+            continue
+        
+        if new_width != 0:
+            frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
+
+        # Convert to RGB + torch tensor
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = torch.from_numpy(frame.astype(np.float32) / 255.0)  # H,W,C
+        
+        if required_rotation != 0:
+            if required_rotation == 90:
+                # 90 degrees clockwise
+                frame = torch.rot90(frame, k=3, dims=(0, 1))
+            elif required_rotation == 180:
+                frame = torch.rot90(frame, k=2, dims=(0, 1))
+            elif required_rotation == 270:
+                # 270 clockwise = 90 counter-clockwise
+                frame = torch.rot90(frame, k=1, dims=(0, 1))
+        
+        frame = frame.unsqueeze(0)
+        frames.append(frame)
+
+    cap.release()
+    os.unlink(tmp_clip_path)
+    
+    # Final sanity: ensure exact lengths; if underfilled (rare if video ended early), pad by repeating last frame
+    def ensure_length(lst, target):
+        if len(lst) == 0:
+            # no frames at all: impossible earlier but guard
+            raise ValueError("No frames available to form the requested output.")
+        if len(lst) >= target:
+            # Truncate/exactify to target
+            return lst[:target]
+        last = lst[-1]
+        while len(lst) < target:
+            lst.append(last)
+        return lst
+        
+    frames = ensure_length(frames, extract_N_frames)
+    return torch.cat(frames, dim=0)  # (N, H, W, C)
+    
+# ------------------------
+
 
 def loadImageFromUrl(url):
     if url.startswith("data:image/"):
@@ -53,28 +475,32 @@ def loadImageFromUrl(url):
 
     return (image, mask)
 
-
-
-
 # --- Node class ---
 class SILVER_FL_BooruBrowser:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
+                
+                # query options
                 "site": (["Gelbooru","Danbooru","E621"], {}),
-                "AND_tags": ("STRING", {"default": "", "multiline": False}),
+                "AND_tags": ("STRING", {"default": "frieren,", "multiline": False}),
                 "OR_tags": ("STRING", {"default": "", "multiline": False}),
-                "exclude_tags": ("STRING", {"default": "animated,", "multiline": False}),
+                "exclude_tags": ("STRING", {"default": "", "multiline": False}),
                 "limit": ("INT", {"default": 20, "min": 1, "max": 100}),
                 "page": ("INT", {"default": 1, "min": 1}),
                 "Safe": ("BOOLEAN", {"default": True}),
                 "Questionable": ("BOOLEAN", {"default": True}),
                 "Explicit": ("BOOLEAN", {"default": True}),
                 "Order": (["Date","Score"], {}),
+                
+                # ui options
                 "select_random_result": ("BOOLEAN", {"default": False}),
+                "VIDEO_audio_muted": ("BOOLEAN", {"default": False}),
                 "thumbnail_size": ("INT", {"default": 240, "min": 80, "max": 1024}),
                 "thumbnail_quality": (["Low","Normal","High"], {}),
+                
+                # api options
                 "gelbooru_user_id": ("STRING", {"default": ""}),
                 "gelbooru_api_key": ("STRING", {"default": ""}),
                 "danbooru_user_id": ("STRING", {"default": ""}),
@@ -83,14 +509,14 @@ class SILVER_FL_BooruBrowser:
                 "e621_api_key": ("STRING", {"default": ""}),
             },
             "optional": {
-                # This hidden widget is used by the JS UI to set selected image URL
                 "selected_url": ("STRING", {"default": ""}),
                 "selected_img_tags": ("STRING", {"default": ""}),
+                "current_time_ms": ("INT", {"default": 0}),
             }
         }
 
-    RETURN_TYPES = ("IMAGE","STRING")
-    RETURN_NAMES = ("image","imgtags")
+    RETURN_TYPES = ("IMAGE", "STRING", "STRING", "INT")
+    RETURN_NAMES = ("image", "file_url", "tags", "video_current_position")
     FUNCTION = "browse_booru"
     CATEGORY = "Booru"
     DESCRIPTION = """
@@ -104,40 +530,55 @@ Notes:
     - 'select_random_result' will return a random image from the current results (ignores current selection). You should set limit to 50 or even 100 when using this feature.
 """
 
-    def browse_booru(self, site, AND_tags, OR_tags, exclude_tags, limit, page, Safe, Questionable, Explicit, Order, select_random_result, thumbnail_size, thumbnail_quality,
+    def browse_booru(self, site, AND_tags, OR_tags, exclude_tags, limit, page, Safe, Questionable, Explicit, Order,
+        select_random_result, VIDEO_audio_muted, thumbnail_size, thumbnail_quality,
         gelbooru_user_id, gelbooru_api_key, danbooru_user_id, danbooru_api_key, e621_user_id, e621_api_key, 
-        selected_url="", selected_img_tags=""):
+        selected_url="", selected_img_tags="", current_time_ms=0):
         
-        if not selected_url or (select_random_result and RANDOMLY_SELECTED_URL == ""):
-            return (torch.zeros(1,1,1,3), "")
+        empty_img = torch.zeros(1,1,1,3)
+        file_url = selected_url if not select_random_result else RANDOMLY_SELECTED_URL
+        if not file_url:
+            return (empty_img, "", "", current_time_ms)
             
         try:
-            img, mask = loadImageFromUrl(selected_url if not select_random_result else RANDOMLY_SELECTED_URL)
+            is_video = isVideo(file_url)
+            if not is_video:
+                img, mask = loadImageFromUrl(file_url)
+            else:
+                if FFMPEG_available:
+                    img = select_single_frame(file_url, current_time_ms if not select_random_result else 0)
+                else:
+                    print("[SILVER_FL_BooruBrowser] WARNING: FFMPEG not available! Please add 'animated' to exclude_tags until you install it. Output image will be blank.")
+                    img = empty_img
+            
             img_tags = ", ".join([tag.strip() for tag in selected_img_tags.lower().replace(',', ' ').split(' ') if tag.strip() != ''])
-            return (img, img_tags)
+            
+            return (img, file_url, img_tags, current_time_ms)
         except Exception as e:
-            print("[SILVER_FL_BooruBrowser] error loading selected_url:", e)
-            return (torch.zeros(1,1,1,3), "")
+            print("[SILVER_FL_BooruBrowser] error loading file_url:", e)
+            return (empty_img, file_url, "", current_time_ms)
 
     @classmethod
-    def IS_CHANGED(cls, site, AND_tags, OR_tags, exclude_tags, limit, page, Safe, Questionable, Explicit, Order, select_random_result, thumbnail_size, thumbnail_quality,
+    def IS_CHANGED(cls, site, AND_tags, OR_tags, exclude_tags, limit, page, Safe, Questionable, Explicit, Order,
+        select_random_result, VIDEO_audio_muted, thumbnail_size, thumbnail_quality,
         gelbooru_user_id, gelbooru_api_key, danbooru_user_id, danbooru_api_key, e621_user_id, e621_api_key, 
-        selected_url="", selected_img_tags=""):
+        selected_url="", selected_img_tags="", current_time_ms=0):
         # Node is considered changed when a thumbnail selection modifies selected_url OR when select_random_result is True
         # comfyUI assumes the node is changed when the output of this function is different than the last time it ran
         # so we need to retrieve the random url from here when select_random_result and might as well turn it empty string here as well when not select_random_result
         if select_random_result:
             global RANDOMLY_SELECTED_URL
             RANDOMLY_SELECTED_URL = random.choice(CURRENT_URLS)
-            return RANDOMLY_SELECTED_URL
+            return RANDOMLY_SELECTED_URL + str(current_time_ms)
         else:
             RANDOMLY_SELECTED_URL = ""
-            return selected_url
+            return selected_url + str(current_time_ms)
 
     @classmethod
-    def VALIDATE_INPUTS(cls, site, AND_tags, OR_tags, exclude_tags, limit, page, Safe, Questionable, Explicit, Order, select_random_result, thumbnail_size, thumbnail_quality,
+    def VALIDATE_INPUTS(cls, site, AND_tags, OR_tags, exclude_tags, limit, page, Safe, Questionable, Explicit, Order,
+        select_random_result, VIDEO_audio_muted, thumbnail_size, thumbnail_quality,
         gelbooru_user_id, gelbooru_api_key, danbooru_user_id, danbooru_api_key, e621_user_id, e621_api_key, 
-        selected_url="", selected_img_tags=""):
+        selected_url="", selected_img_tags="", current_time_ms=0):
         
         s = ""
         if page < 1:
@@ -153,6 +594,53 @@ Notes:
         
         return True
 
+
+
+class SILVER_Online_Video_Frame_Extractor:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "file_url": ("STRING", {"default": "", "multiline": False}),
+                "extract_time_start_ms": ("INT", {"default": 0, "min": 0, "max": 500000}),
+                "extract_duration_range_ms": ("INT", {"default": 5000, "min": 500, "max": 120000}),
+                "extract_N_frames": ("INT", {"default": 81, "min": 1, "max": 720}),
+                "frame_max_width": ("INT", {"default": 1024, "min": 64, "max": 4096}),
+                "frame_max_height": ("INT", {"default": 1024, "min": 64, "max": 4096}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("frames",)
+    FUNCTION = "get_frames"
+    CATEGORY = "Booru"
+    DESCRIPTION = "EXPERIMENTAL"
+
+    def get_frames(self, file_url, extract_time_start_ms, extract_duration_range_ms, extract_N_frames, frame_max_width, frame_max_height):
+        empty_img = torch.zeros(1,1,1,3)
+        if not file_url:
+            print("[SILVER_Online_Video_Frame_Extractor] invalid file_url")
+            return (empty_img,)
+        try:
+            if isVideo(file_url):
+                if FFMPEG_available:
+                    selected_frames = extract_video_frames(file_url, extract_time_start_ms, extract_duration_range_ms, extract_N_frames, frame_max_width, frame_max_height)
+                    return (selected_frames,)
+                else:
+                    print("[SILVER_Online_Video_Frame_Extractor] WARNING: FFMPEG not available! Output image will be blank.")
+                    return (empty_img,)
+            else:
+                print("[SILVER_Online_Video_Frame_Extractor] file_url is not a video! Returning single image.")
+                img, mask = loadImageFromUrl(file_url)
+                return (img,)
+        except Exception as e:
+            print(f"[SILVER_Online_Video_Frame_Extractor] failed to extract frames from: {file_url}\nError: {e}")
+            return (empty_img,)
+
+
+
+        
+    
 
 # --- HTTP endpoints for the UI (search + thumb proxy) ---
 @PromptServer.instance.routes.post("/silver_fl_booru/search")
@@ -178,7 +666,7 @@ async def api_booru_search(request):
       "e621_user_id": "",
       "e621_api_key": ""
     }
-    Returns: JSON { "posts": [ {id, file_url, preview_url, tags, width, height, source} ... ] }
+    Returns: JSON { "posts": [ {id, isVideo, file_url, preview_url, tags, width, height, source} ... ] }
     """
     global CURRENT_URLS
     try:
@@ -403,6 +891,7 @@ async def api_booru_search(request):
                 CURRENT_URLS.append(file_url)
                 out_posts.append({
                     "id": id,
+                    "isVideo": isVideo(file_url),
                     "file_url": file_url,
                     "preview_url": preview_url,
                     "tags": tags,
@@ -465,21 +954,93 @@ async def api_booru_thumb(request):
         print("[SILVER_FL_BooruBrowser] /thumb error:", e)
         return web.json_response({"error": str(e)}, status=500)
 
+@PromptServer.instance.routes.post("/silver_fl_booru/videoprobe")
+async def api_video_probe(request):
+    """
+    Right now we only need duration and rotation so that's all we are probing for here.
+    Returns: JSON { "duration_ms": INT, "rotation": INT }
+    """
+    try:
+        data = await request.json()
+        file_url = data.get("file_url", "")
+        duration_ms, rotation = get_video_duration_and_rotation(file_url)
+        return web.json_response({"duration_ms": duration_ms, "rotation": rotation})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
 
-
+@PromptServer.instance.routes.get("/silver_fl_booru/videostream")
+async def api_video_stream(request):
+    try:
+        file_url = request.query.get("file_url")
+        if file_url is None:
+            return web.json_response({"error": "file_url required"}, status=400)
+        
+        # currently not used cause its handled via browser's native <video>
+        seek_time_str = request.query.get("seek_time")
+        seek_time = 0.0
+        if seek_time_str:
+            try:
+                seek_time = float(seek_time_str)
+            except ValueError:
+                pass
+        
+        range_header = request.headers.get("Range") # Forward range header if present
+        headers = {}
+        if range_header:
+            headers["Range"] = range_header
+        
+        try:
+            session = aiohttp.ClientSession()
+            resp = await session.get(file_url, headers=headers, ssl=file_url.startswith("https"))
+            status = resp.status
+            
+            response_headers = {
+                "Content-Type": resp.headers.get("Content-Type", "application/octet-stream"),
+            }
+            # Pass through range-related headers
+            for h in ["Content-Range", "Accept-Ranges", "Content-Length"]:
+                if h in resp.headers:
+                    response_headers[h] = resp.headers[h]
+            
+            # Create a streaming response
+            stream_resp = web.StreamResponse(
+                status=status,
+                headers=response_headers
+            )
+            await stream_resp.prepare(request)
+            
+            # Stream the data
+            async for chunk in resp.content.iter_chunked(1024 * 64):
+                try:
+                    await stream_resp.write(chunk)
+                except ConnectionResetError:
+                    break
+                except Exception as e2:
+                    #print(f"[SILVER_FL_BooruBrowser] Write error: {e2}")
+                    break
+            
+            await stream_resp.write_eof()
+            return stream_resp
+        finally:
+            # Ensure the aiohttp response is released and the session is closed
+            if 'resp' in locals() and resp:
+                resp.release()
+            await session.close()
+    
+    except Exception as e:
+        if 'session' in locals() and session and not session.closed:
+             await session.close()
+        return web.json_response({"error": str(e)}, status=500)
 
 
 NODE_CLASS_MAPPINGS = {
     "SILVER_FL_BooruBrowser": SILVER_FL_BooruBrowser,
+    "SILVER_Online_Video_Frame_Extractor": SILVER_Online_Video_Frame_Extractor,
 }
-
-
 
 # Provide a display name mapping so it looks nice in the node list (optional)
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SILVER_FL_BooruBrowser": "[Silver] Booru Browser",
+    "SILVER_Online_Video_Frame_Extractor": "[Silver] Online Video Frame Extractor (REQUIRES FFMPEG)",
 }
-
-
-
 
