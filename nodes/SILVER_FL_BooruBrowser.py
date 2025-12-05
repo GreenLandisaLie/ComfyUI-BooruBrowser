@@ -67,27 +67,58 @@ def check_ffmpeg():
 
 FFMPEG_available = check_ffmpeg()
 
-def run_ffprobe_on_bytes(data: bytes) -> Optional[dict]:
+def run_ffprobe_on_url(file_url: str) -> Optional[dict]:
+    """Runs ffprobe directly on file_url and returns JSON metadata."""
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "quiet",
+                "-print_format", "json",
+                "-show_entries", "stream=tags,side_data_list,displaymatrix",
+                "-show_format",
+                "-show_streams",
+                file_url
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        
+        if proc.returncode != 0:
+            # ffprobe failed but sometimes stderr contains useful info
+            print("ffprobe URL error:", proc.stderr)
+            return None
+        
+        return json.loads(proc.stdout)
+    
+    except Exception as e:
+        print(f"Failed to probe video: {e}")
+        return None
+
+def run_ffprobe_on_bytes(data: bytes, file_url: str) -> Optional[dict]:
     """Runs ffprobe on byte data fed via stdin and returns JSON metadata."""
     try:
         proc = subprocess.Popen(
             [
-                "ffprobe", "-v", "error",
+                "ffprobe", "-v", "quiet",
                 "-print_format", "json",
                 "-show_format",
+                "-show_entries", "stream=tags,side_data_list,displaymatrix",
                 "-show_streams",
                 "pipe:0"
-            ],
+            ],            
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE
         )
         out, err = proc.communicate(input=data, timeout=5)
-
-        if proc.returncode != 0:
-            return None
         
-        return json.loads(out.decode("utf-8"))
+        if proc.returncode != 0:
+            return run_ffprobe_on_url(file_url)
+        
+        metadata = json.loads(out.decode("utf-8"))
+        return metadata
     except Exception as e:
         print(f"Failed to probe video: {e}")
         return None
@@ -114,7 +145,7 @@ def probe_video(file_url):
         for chunk in resp.iter_content(chunk_size=64 * 1024):
             probe_data.extend(chunk)
     
-    metadata = run_ffprobe_on_bytes(bytes(probe_data))
+    metadata = run_ffprobe_on_bytes(bytes(probe_data), file_url)
     if not metadata:
         #print("FFprobe could not parse metadata.")
         return None
@@ -265,6 +296,56 @@ def convert_gif_to_mp4(gif_path):
             os.unlink(mp4_path)
         return None
 
+def calculate_blurriness(frame):
+    """
+    FFT high-frequency energy.
+    LOWER return value = SHARPER frame.
+    """
+
+    # 1. Convert to grayscale
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    
+    # 2. Downscale to reduce FFT cost (factor 2–3 is ideal) -- ONLY FOR IMAGES EQUAL OR HIGHER THAN 640x640
+    #    This does NOT meaningfully affect sharpness measurement.
+    height, width = frame.shape[:2]
+    if height * width >= 640 * 640:
+        img = cv2.resize(gray, (0,0), fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+    else:
+        img = gray
+    
+    # 3. Convert to float32
+    img = img.astype(np.float32)
+    
+    # 4. FFT
+    F = np.fft.fft2(img)
+    Fshift = np.fft.fftshift(F)
+
+    # 5. Compute magnitude spectrum
+    mag = np.abs(Fshift)
+
+    # 6. Define high-frequency mask:
+    #    Keep only outer 40% of the spectrum → best for blur detection.
+    h, w = mag.shape
+    cy, cx = h // 2, w // 2
+
+    # radius threshold (tunable; 0.4–0.5 works well)
+    radius = 0.4 * min(cy, cx)
+
+    # distance grid
+    y = np.arange(h) - cy
+    x = np.arange(w) - cx
+    xv, yv = np.meshgrid(x, y)
+    dist = np.sqrt(xv*xv + yv*yv)
+
+    # high frequency region: outside the radius
+    high_freq_mask = dist > radius
+
+    # 7. High-frequency energy
+    hf_energy = mag[high_freq_mask].mean() + 1e-6
+
+    # 8. Invert so LOWER = SHARPER
+    return 1.0 / hf_energy
+
 def select_single_frame(file_url, extract_time_start_ms):
     t = torch.zeros(1,1,1,3)
 
@@ -328,10 +409,10 @@ def select_single_frame(file_url, extract_time_start_ms):
     
     return t
 
-def extract_video_frames(file_url, extract_time_start_ms, extract_duration_range_ms, extract_N_frames, frame_max_width, frame_max_height):
+def extract_video_frames(file_url, extract_time_start_ms, extract_duration_range_ms, extract_N_frames, frame_max_width, frame_max_height, filter_blurry_frames):
     t = torch.zeros(1,1,1,3)
     
-    is_gif = file_url.endswith(".gif")# or file_url.endswith(".gifv")
+    is_gif = file_url.endswith(".gif")
     if is_gif:
         tmp_clip_path = download_temp_gif(file_url)
         try:
@@ -362,23 +443,51 @@ def extract_video_frames(file_url, extract_time_start_ms, extract_duration_range
         
     _, required_rotation = get_video_duration_and_rotation(file_url)
     
+    extract_N_frames = 1 if extract_N_frames <= 1 else extract_N_frames 
     if extract_N_frames == 1:
-        target_idxs = [0]
+        base_target_idxs = [0]
     else:
-        target_idxs = [
-            int(round(i * (total_frames - 1) / (extract_N_frames - 1)))
-            for i in range(extract_N_frames)
-        ]
+        step = (total_frames - 1) / (extract_N_frames - 1)
+        base_target_idxs = [min(int(round(i * step)), total_frames - 1) for i in range(extract_N_frames)]
+    
+    # Build ±N candidate windows (up to ±5 when enough total_frames)
+    WINDOW_SIZE = 0
+    for N in [5, 4, 3, 2, 1]:
+        if total_frames >= extract_N_frames * N:
+            WINDOW_SIZE = N
+            break
+    
+    def build_windows(base_idxs):
+        windows = []
+        for idx in base_idxs:
+            s = max(0, idx - WINDOW_SIZE)
+            e = min(total_frames - 1, idx + WINDOW_SIZE)
+            windows.append(list(range(s, e + 1)))
+        return windows
 
-    frames = []
+    frame_windows = build_windows(base_target_idxs)
+    filter_blurry_frames = filter_blurry_frames and extract_N_frames > 1 and WINDOW_SIZE > 0 and not is_gif
+    
+    # 1. Determine final set of unique indices to read
+    if filter_blurry_frames:
+        unique_target_idxs = set() # Use a set to collect unique candidate indices
+        for window in frame_windows:
+            unique_target_idxs.update(window)
+        # Sort them for better sequential reading performance from cv2
+        target_idxs_to_read = sorted(list(unique_target_idxs))
+    else:
+        target_idxs_to_read = base_target_idxs
+    
+    frameIDX_frame = {}
     dimensions_checked = False
     new_width = 0
     new_height = 0
-    for idx in target_idxs:
+
+    # 2. Read frames by index (addresses memory bottleneck)
+    for idx in target_idxs_to_read:
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ret, frame = cap.read()
-
-        # Resize while keeping aspect ratio
+        
         if not dimensions_checked and ret and frame is not None:
             dimensions_checked = True
             (original_height, original_width) = frame.shape[:2]
@@ -386,56 +495,138 @@ def extract_video_frames(file_url, extract_time_start_ms, extract_duration_range
             height_ratio = frame_max_height / original_height
             scale_factor = min(width_ratio, height_ratio)
             if scale_factor < 1.0:
-                new_width = int(original_width * scale_factor) - (int(original_width * scale_factor) % 2) # ensure divisible by 2
-                new_height = int(original_height * scale_factor) - (int(original_height * scale_factor) % 2) # ensure divisible by 2
+                new_width = int(original_width * scale_factor) - (int(original_width * scale_factor) % 2)
+                new_height = int(original_height * scale_factor) - (int(original_height * scale_factor) % 2)
         
         if not ret or frame is None:
-            if dimensions_checked and new_width != 0:
-                # Fallback black frame with *correct* determined size (H, W, C)
-                black_frame = torch.zeros(new_height, new_width, 3).unsqueeze(0)
-                frames.append(black_frame)
-            else:
-                pass 
+            if len(frameIDX_frame) > 0:
+                # Fallback: Copy last successfully selected frame
+                last_key = list(frameIDX_frame.keys())[-1]
+                frameIDX_frame[idx] = frameIDX_frame[last_key]
+            # else: the index is truly missing, which ensure_dict_indices will handle
             continue
+            
+        frameIDX_frame[idx] = frame
+    
+    cap.release()
+    os.unlink(tmp_clip_path)
+    
+    if len(frameIDX_frame) == 0:
+        raise ValueError("No frames decoded.")
+    
+    # 3. Ensure all necessary indices exist (especially if first frame read failed)
+    def ensure_dict_indices(d, indices):
+        indices_in_d = list(d.keys())
+        missing_indices = [idx for idx in indices if idx not in indices_in_d]
         
-        if new_width != 0:
-            frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
+        for idx in missing_indices:
+            # Find the closest index that *was* read successfully
+            closest_idx = min(indices_in_d, key=lambda x: abs(x - idx))
+            d[idx] = d[closest_idx]
+            
+        # Optimization: remove frames we read but aren't needed for the final selection (only relevant if filter_blurry_frames is False)
+        unwanted_indices = [idx for idx in indices_in_d if idx not in indices] 
+        for idx in unwanted_indices:
+            del d[idx]
+            
+        return d
+        
+    if filter_blurry_frames:
+        # We need all unique candidate indices to be present for the next step
+        frameIDX_frame = ensure_dict_indices(frameIDX_frame, target_idxs_to_read)
+    else:
+        # We only need the base indices to be present
+        frameIDX_frame = ensure_dict_indices(frameIDX_frame, base_target_idxs)
 
-        # Convert to RGB + torch tensor
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame = torch.from_numpy(frame.astype(np.float32) / 255.0)  # H,W,C
+    # 4. For each window, compute blurriness and choose the sharpest
+    def choose_sharpest(d, windows, total_frames):
+        chosen_indices = []
+        all_idx_score = {} # avoid re-scoring the same frame
+        for base_idx, cand_list in zip(base_target_idxs, windows):
+            idx_score = {}
+            
+            for idx in cand_list:
+                if idx not in all_idx_score:
+                    try:
+                        frame = d[idx]
+                        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        # NOTE: Blur metric returns LOWER value for SHARPER image
+                        score = calculate_blurriness(rgb) 
+                    except:
+                        score = float('inf') # Highest score (worst blur) for safety
+                    all_idx_score[idx] = score
+                else:
+                    score = all_idx_score[idx]
+                
+                idx_score[idx] = score
+            
+            scores = list(idx_score.values())
+            same_score = len(set(scores)) == 1
+            
+            if same_score:
+                # Tie-breaker logic (refactored):
+                # 1. Prefer frame 0
+                if 0 in cand_list:
+                    best_idx = 0
+                # 2. Else, prefer last frame
+                elif total_frames - 1 in cand_list:
+                    best_idx = total_frames - 1
+                # 3. Else, select the original target frame index (center of the window)
+                else:
+                    best_idx = base_idx # The original index that generated the window
+            else:
+                # lower score is sharper in 'calculate_blurriness'. We use min().
+                best_idx = min(idx_score, key=idx_score.get)
+            
+            chosen_indices.append(best_idx)
+            
+        return chosen_indices
+    
+    
+    if filter_blurry_frames:
+        chosen_indices = choose_sharpest(frameIDX_frame, frame_windows, total_frames)
+    else:
+        chosen_indices = base_target_idxs
+
+    # 5. Final frame assembly
+    # Re-order/select frames based on the chosen indices
+    frames = [frameIDX_frame[idx] for idx in chosen_indices]
+    
+    # At this point, the proper frames have been selected. We only need to:
+    # - resize, convert them to tensor and rotate if necessary
+    if new_width != 0: # RESIZE
+        frames = [cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA) for frame in frames]
+    
+    frames = [cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) for frame in frames] # RGB
+    tensor_frames = []
+    for frame in frames:
+        tensor_frame = torch.from_numpy(frame.astype(np.float32) / 255.0)
         
         if required_rotation != 0:
             if required_rotation == 90:
-                # 90 degrees clockwise
-                frame = torch.rot90(frame, k=3, dims=(0, 1))
+                tensor_frame = torch.rot90(tensor_frame, k=3, dims=(0, 1)) # 90 degrees clockwise
             elif required_rotation == 180:
-                frame = torch.rot90(frame, k=2, dims=(0, 1))
+                tensor_frame = torch.rot90(tensor_frame, k=2, dims=(0, 1))
             elif required_rotation == 270:
-                # 270 clockwise = 90 counter-clockwise
-                frame = torch.rot90(frame, k=1, dims=(0, 1))
+                tensor_frame = torch.rot90(tensor_frame, k=1, dims=(0, 1)) # 270 clockwise
         
-        frame = frame.unsqueeze(0)
-        frames.append(frame)
-
-    cap.release()
-    os.unlink(tmp_clip_path)
+        tensor_frame = tensor_frame.unsqueeze(0)
+        tensor_frames.append(tensor_frame)
     
     # Final sanity: ensure exact lengths; if underfilled (rare if video ended early), pad by repeating last frame
     def ensure_length(lst, target):
         if len(lst) == 0:
-            # no frames at all: impossible earlier but guard
             raise ValueError("No frames available to form the requested output.")
         if len(lst) >= target:
-            # Truncate/exactify to target
             return lst[:target]
         last = lst[-1]
         while len(lst) < target:
             lst.append(last)
         return lst
         
-    frames = ensure_length(frames, extract_N_frames)
-    return torch.cat(frames, dim=0)  # (N, H, W, C)
+    tensor_frames = ensure_length(tensor_frames, extract_N_frames)
+    
+    return torch.cat(tensor_frames, dim=0) # (N, H, W, C)
     
 # ------------------------
 
@@ -607,6 +798,7 @@ class SILVER_Online_Video_Frame_Extractor:
                 "extract_N_frames": ("INT", {"default": 81, "min": 1, "max": 720}),
                 "frame_max_width": ("INT", {"default": 1024, "min": 64, "max": 4096}),
                 "frame_max_height": ("INT", {"default": 1024, "min": 64, "max": 4096}),
+                "filter_blurry_frames": ("BOOLEAN", {"default": False}),
             }
         }
 
@@ -616,7 +808,7 @@ class SILVER_Online_Video_Frame_Extractor:
     CATEGORY = "Booru"
     DESCRIPTION = "EXPERIMENTAL"
 
-    def get_frames(self, file_url, extract_time_start_ms, extract_duration_range_ms, extract_N_frames, frame_max_width, frame_max_height):
+    def get_frames(self, file_url, extract_time_start_ms, extract_duration_range_ms, extract_N_frames, frame_max_width, frame_max_height, filter_blurry_frames):
         empty_img = torch.zeros(1,1,1,3)
         if not file_url:
             print("[SILVER_Online_Video_Frame_Extractor] invalid file_url")
@@ -624,7 +816,7 @@ class SILVER_Online_Video_Frame_Extractor:
         try:
             if isVideo(file_url):
                 if FFMPEG_available:
-                    selected_frames = extract_video_frames(file_url, extract_time_start_ms, extract_duration_range_ms, extract_N_frames, frame_max_width, frame_max_height)
+                    selected_frames = extract_video_frames(file_url, extract_time_start_ms, extract_duration_range_ms, extract_N_frames, frame_max_width, frame_max_height, filter_blurry_frames)
                     return (selected_frames,)
                 else:
                     print("[SILVER_Online_Video_Frame_Extractor] WARNING: FFMPEG not available! Output image will be blank.")
