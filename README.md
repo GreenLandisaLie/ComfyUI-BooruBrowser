@@ -7,6 +7,9 @@ Created with the help of ChatGPT and Gemini
 UI based on the FL Load Image node (highly recommended) from https://github.com/filliptm/ComfyUI_Fill-Nodes
 
 # Changelog:
+- v3.1.1
+	- Fixed calculation of WINDOW_SIZE 
+
 - v3.1.0
 	- Some of the videos that previously were not parsing 'duration' are now parsing it correctly by falling back to FFprobe directly via url.
  	- Added a basic 'filter_blurry_frames' functionality to the Online Video Frame Extractor node. Its not as effective as I was hoping but it works in some cases - although it may damage the animation a little bit. It basically checks for blurriness levels of nearby frames and selects the one with the least. You should only experiment with this when handling real life footage - hand-drawn animations do not have motion-blur.
