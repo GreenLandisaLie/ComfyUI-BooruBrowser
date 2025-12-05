@@ -453,7 +453,7 @@ def extract_video_frames(file_url, extract_time_start_ms, extract_duration_range
     # Build ±N candidate windows (up to ±5 when enough total_frames)
     WINDOW_SIZE = 0
     for N in [5, 4, 3, 2, 1]:
-        if total_frames >= extract_N_frames * N:
+        if total_frames >= extract_N_frames * ((N * 2) + 1):
             WINDOW_SIZE = N
             break
     
@@ -1235,4 +1235,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SILVER_FL_BooruBrowser": "[Silver] Booru Browser",
     "SILVER_Online_Video_Frame_Extractor": "[Silver] Online Video Frame Extractor (REQUIRES FFMPEG)",
 }
+
 
