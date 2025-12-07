@@ -7,6 +7,9 @@ Created with the help of ChatGPT and Gemini
 UI based on the FL Load Image node (highly recommended) from https://github.com/filliptm/ComfyUI_Fill-Nodes
 
 # Changelog:
+- v3.1.2
+	- Improved window calculation for blurry frames filter
+
 - v3.1.1
 	- Fixed calculation of WINDOW_SIZE 
 
