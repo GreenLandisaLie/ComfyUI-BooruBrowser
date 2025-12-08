@@ -26,6 +26,7 @@ function addBooruBrowserUI(node) {
 	
 	const thumbnailSizeWidget = node.widgets.find(w => w.name === "thumbnail_size");
 	const thumbnailQualityWidget = node.widgets.find(w => w.name === "thumbnail_quality");
+	const showFileExtWidget = node.widgets.find(w => w.name === "show_file_ext");
 	
     const gelbooru_userWidget = node.widgets.find(w => w.name === "gelbooru_user_id");
     const gelbooru_apiWidget = node.widgets.find(w => w.name === "gelbooru_api_key");
@@ -46,7 +47,7 @@ function addBooruBrowserUI(node) {
     // UI sizing constants
 	const MIN_WIDTH = 500;
     const MIN_HEIGHT = 1000;
-    const TOP_PADDING = 730;
+    const TOP_PADDING = 750;
     const INPUT_SPACING = 6;
 	const THUMB_SIZE = thumbnailSizeWidget ? thumbnailSizeWidget.value : 240;
     const THUMB_PADDING = 8;
@@ -128,6 +129,27 @@ function addBooruBrowserUI(node) {
 			fullScreentimeDisplay.textContent = `${currentTimeStr} / ${totalTime}`;
 		}
 	}
+	
+	function extractExtension(url) {
+		const lastDot = url.lastIndexOf(".");
+		if (lastDot === -1) return null;
+	
+		// take substring after last '.'
+		let ext = url.substring(lastDot + 1);
+	
+		// strip query params if present
+		const q = ext.indexOf("?");
+		if (q !== -1) {
+			ext = ext.substring(0, q);
+		}
+	
+		// common booru extensions: jpg, jpeg, png, webp, gif, mp4, webm, etc
+		if (ext.length >= 2 && ext.length <= 4) {
+			return ext.toUpperCase();
+		}
+	
+		return null;
+	}
 
     // draw background (inputs are widgets; below we render the thumbnail area)
     node.onDrawBackground = function(ctx) {
@@ -190,47 +212,96 @@ function addBooruBrowserUI(node) {
             } else {
                 // normal thumbnail rendering (image or placeholder)
                 const bm = thumbnails[i];
-                if (bm) {
+                if (bm) { // non-active/selected thumbnails that are already available
                     try {
                         ctx.drawImage(bm, x + 2, y + 2, currentThumbSize - 4, currentThumbSize - 4);
+						
+						const ext = extractExtension(p.file_url);
+						if (ext && showFileExtWidget.value) {
+							let extColor = "white";
+							extColor = ext === "GIF" ? "#e98f00" // GIF
+								// VIDEOS
+								: (ext === "GIFV" || ext === "MP4" || ext === "WEBM" || ext === "M4V" || ext ==="MP4" || ext ==="M4V" || ext ==="WEBM" 
+									|| ext ==="MOV" || ext ==="QT" || ext ==="AVI" || ext ==="MKV" || ext ==="FLV" || ext ==="F4V" 
+									|| ext ==="WMV" || ext ==="MPG" || ext ==="MPEG" || ext ==="M2TS" || ext ==="3GP" || ext ==="3G2") ? "#003e73"
+								// LOSSY/HIGH COMPRESSION IMG EXT - webp supports lossless compression but we are more likely to find lossy ones on boorus
+								: (ext === "JPG" || ext === "JPEG" || ext === "WEBP" || ext === "AVIF") ? "yellow"
+								// LOSSLESS/High-Efficiency IMG EXT
+								: (ext === "PNG" || ext === "BMP" || ext === "TIFF" || ext === "TIF" || ext === "HEIF" || ext === "HEIC" || ext === "SVG") ? "green"
+								: extColor;
+							
+							// Scale font size relative to thumbnail size
+							const fontScale = 0.08;              // tweak if needed
+							const fontSize = Math.max(8, currentThumbSize * fontScale);
+							
+							// Margin from edges, also scaled
+							const marginScale = 0.03;            // tweak if needed
+							const margin = currentThumbSize * marginScale;
+							
+							ctx.fillStyle = extColor;
+							ctx.font = `bold ${fontSize}px sans-serif`;
+							ctx.textBaseline = "top";
+							ctx.textAlign = "left";
+							
+							// Text position
+							const tx = x + margin;
+							const ty = y + margin;
+							
+							// Optional: small shadow to improve clarity
+							ctx.shadowColor = "rgba(0,0,0,0.7)";
+							ctx.shadowBlur = fontSize * 0.25;
+							ctx.shadowOffsetX = 0;
+							ctx.shadowOffsetY = 0;
+							
+							ctx.fillText(ext, tx, ty);
+							
+							// Reset shadow
+							ctx.shadowBlur = 0;
+						}
+						
 						if (p.isVideo) {
+							
+							const isGif = ext && ext === "GIF";
+							
 							ctx.fillStyle = "#ffffff"; // white fill
-							ctx.strokeStyle = "#003e73"; // border
+							ctx.strokeStyle = isGif ? "#e98f00" : "#003e73"; // border -> orange for gifs and blue for videos
 							ctx.lineJoin = "round"; // smoother corners
 							
-							ctx.beginPath();
-							
-							// Adjust this for overall size increase
-							const scale = 1.6;  
-							
+							// Triangle scale based on thumbnail size
+							const triSize = currentThumbSize * 0.1;
+							const halfH = triSize * 0.9;               // vertical half-height
+							const rightW = triSize * 1.1;              // right point width
 							const cx = x + currentThumbSize / 2;
 							const cy = y + currentThumbSize / 2;
 							
-							// Original dimensions were: (-12, -16) → (18 wide, 32 tall)
-							ctx.moveTo(cx - 12 * scale, cy - 16 * scale);
-							ctx.lineTo(cx + 18 * scale, cy);
-							ctx.lineTo(cx - 12 * scale, cy + 16 * scale);
+							ctx.beginPath();
+							ctx.moveTo(cx - triSize,  cy - halfH);   // top-left
+							ctx.lineTo(cx + rightW,   cy);           // right-center
+							ctx.lineTo(cx - triSize,  cy + halfH);   // bottom-left
 							ctx.closePath();
 							
-							// Border width proportional to triangle size
-							ctx.lineWidth = 3 * scale;
+							ctx.lineWidth = triSize * 0.25; // proportional border width
 							
 							ctx.fill();
 							ctx.stroke();
 						}
                     } catch {}
-                } else {
+                } else { // non-active/selected thumbnails that are NOT YET available
                     ctx.fillStyle = "#2d2d30";
                     ctx.fillRect(x + 2, y + 2, currentThumbSize - 4, currentThumbSize - 4);
-					if (p.isVideo) {
-						// tiny icon indicating video (triangle)
-						ctx.fillStyle = "#a0a0a0";
-						ctx.beginPath();
+					if (p.isVideo) { // tiny icon indicating video (triangle)
+						// Triangle scale based on thumbnail size
+						const triSize = currentThumbSize * 0.1;
+						const halfH = triSize * 0.9;               // vertical half-height
+						const rightW = triSize * 1.1;              // right point width
 						const cx = x + currentThumbSize / 2;
 						const cy = y + currentThumbSize / 2;
-						ctx.moveTo(cx - 12, cy - 16);
-						ctx.lineTo(cx + 18, cy);
-						ctx.lineTo(cx - 12, cy + 16);
+						
+						ctx.fillStyle = "#a0a0a0";
+						ctx.beginPath();
+						ctx.moveTo(cx - triSize,  cy - halfH);   // top-left
+						ctx.lineTo(cx + rightW,   cy);           // right-center
+						ctx.lineTo(cx - triSize,  cy + halfH);   // bottom-left
 						ctx.closePath();
 						ctx.fill();
 					}
@@ -245,11 +316,8 @@ function addBooruBrowserUI(node) {
             }
         });
 		
-		
-		
 		// 💡 Must restore the context state after the drawing is done
 		ctx.restore(); 
-		
 		
         // draw a simple scrollbar indicator
         const totalRows = Math.ceil(posts.length / thumbsPerRow);
@@ -1015,7 +1083,7 @@ function addBooruBrowserUI(node) {
 					videoContainer.removeChild(videoContainer.querySelector('img'));
 				}
 				
-				// 2. Insert the new active video element at the top
+				// 3. Insert the new active video element at the top
 				videoContainer.prepend(activeVideo);
 			}
 	
