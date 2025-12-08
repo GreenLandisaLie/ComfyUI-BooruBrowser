@@ -7,6 +7,10 @@ Created with the help of ChatGPT and Gemini
 UI based on the FL Load Image node (highly recommended) from https://github.com/filliptm/ComfyUI_Fill-Nodes
 
 # Changelog:
+- v3.2.0
+	- Added a new option 'show_file_ext' -> reveals the file extension at the top-left corner of the thumbnail
+ 	- Fixed video triangle indicator not resizing proportionally with the thumbnail square
+
 - v3.1.2
 	- Improved window calculation for blurry frames filter
 
