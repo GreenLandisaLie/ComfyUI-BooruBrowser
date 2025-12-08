@@ -469,7 +469,7 @@ def extract_video_frames(file_url, extract_time_start_ms, extract_duration_range
             e = min(total_frames - 1, idx + WINDOW_SIZE) if not minimal_mode else min(total_frames - 1, idx)
             windows.append(list(range(s, e + 1)))
         return windows
-
+    
     frame_windows = build_windows(base_target_idxs, WINDOW_SIZE_MINIMAL_MODE)
     filter_blurry_frames = filter_blurry_frames and extract_N_frames > 1 and WINDOW_SIZE > 0 and not is_gif
     
@@ -695,6 +695,7 @@ class SILVER_FL_BooruBrowser:
                 "VIDEO_audio_muted": ("BOOLEAN", {"default": False}),
                 "thumbnail_size": ("INT", {"default": 240, "min": 80, "max": 1024}),
                 "thumbnail_quality": (["Low","Normal","High"], {}),
+                "show_file_ext": ("BOOLEAN", {"default": True}),
                 
                 # api options
                 "gelbooru_user_id": ("STRING", {"default": ""}),
@@ -727,7 +728,7 @@ Notes:
 """
 
     def browse_booru(self, site, AND_tags, OR_tags, exclude_tags, limit, page, Safe, Questionable, Explicit, Order,
-        select_random_result, VIDEO_audio_muted, thumbnail_size, thumbnail_quality,
+        select_random_result, VIDEO_audio_muted, thumbnail_size, thumbnail_quality, show_file_ext,
         gelbooru_user_id, gelbooru_api_key, danbooru_user_id, danbooru_api_key, e621_user_id, e621_api_key, 
         selected_url="", selected_img_tags="", current_time_ms=0):
         
@@ -756,7 +757,7 @@ Notes:
 
     @classmethod
     def IS_CHANGED(cls, site, AND_tags, OR_tags, exclude_tags, limit, page, Safe, Questionable, Explicit, Order,
-        select_random_result, VIDEO_audio_muted, thumbnail_size, thumbnail_quality,
+        select_random_result, VIDEO_audio_muted, thumbnail_size, thumbnail_quality, show_file_ext,
         gelbooru_user_id, gelbooru_api_key, danbooru_user_id, danbooru_api_key, e621_user_id, e621_api_key, 
         selected_url="", selected_img_tags="", current_time_ms=0):
         # Node is considered changed when a thumbnail selection modifies selected_url OR when select_random_result is True
@@ -772,7 +773,7 @@ Notes:
 
     @classmethod
     def VALIDATE_INPUTS(cls, site, AND_tags, OR_tags, exclude_tags, limit, page, Safe, Questionable, Explicit, Order,
-        select_random_result, VIDEO_audio_muted, thumbnail_size, thumbnail_quality,
+        select_random_result, VIDEO_audio_muted, thumbnail_size, thumbnail_quality, show_file_ext,
         gelbooru_user_id, gelbooru_api_key, danbooru_user_id, danbooru_api_key, e621_user_id, e621_api_key, 
         selected_url="", selected_img_tags="", current_time_ms=0):
         
@@ -1240,7 +1241,4 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SILVER_FL_BooruBrowser": "[Silver] Booru Browser",
     "SILVER_Online_Video_Frame_Extractor": "[Silver] Online Video Frame Extractor (REQUIRES FFMPEG)",
 }
-
-
-
 
