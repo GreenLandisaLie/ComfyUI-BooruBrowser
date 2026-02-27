@@ -22,8 +22,16 @@ import comfy
 import folder_paths
 from server import PromptServer
 
+_USER_AGENT_ = "ComfyUI-BooruBrowser/1.0"
+USER_AGENT = _USER_AGENT_
 
-USER_AGENT = "ComfyUI-BooruBrowser/1.0"
+EXTRA_SITE_HEADERS = {
+    "gelbooru": {
+        "Referer": "https://gelbooru.com/",
+    },
+    "danbooru": {},
+    "e621": {},
+}
 
 CURRENT_URLS = []
 RANDOMLY_SELECTED_URL = ""
@@ -70,6 +78,7 @@ FFMPEG_available = check_ffmpeg()
 def run_ffprobe_on_url(file_url: str) -> Optional[dict]:
     """Runs ffprobe directly on file_url and returns JSON metadata."""
     try:
+        ffmpeg_headers = get_ffmpeg_headers(file_url)
         proc = subprocess.run(
             [
                 "ffprobe",
@@ -78,6 +87,7 @@ def run_ffprobe_on_url(file_url: str) -> Optional[dict]:
                 "-show_entries", "stream=tags,side_data_list,displaymatrix",
                 "-show_format",
                 "-show_streams",
+                *ffmpeg_headers,
                 file_url
             ],
             stdout=subprocess.PIPE,
@@ -124,7 +134,7 @@ def run_ffprobe_on_bytes(data: bytes, file_url: str) -> Optional[dict]:
         return None
 
 def probe_video(file_url):
-    head = requests.head(file_url)
+    head = requests.head(file_url, headers=getBaseHeadersBySite(file_url))
     if "Content-Length" not in head.headers:
         #print("Server did not provide Content-Length; abort.")
         return None
@@ -138,7 +148,11 @@ def probe_video(file_url):
     
     probe_data = bytearray()
     for r in ranges:
-        resp = requests.get(file_url, headers={"Range": r}, stream=True)
+        
+        headers = {"Range": r}
+        headers.update(getBaseHeadersBySite(file_url))
+        
+        resp = requests.get(file_url, headers=headers, stream=True)
         if resp.status_code not in (200, 206):
             print(f"Failed to fetch probe range {r}")
             return None
@@ -233,9 +247,12 @@ def download_temp_clip(file_url: str, extract_time_start_ms: int, extract_durati
 
     temp_file_path = os.path.join(TEMP_FOLDER, f"temp_clip_{uuid.uuid4()}.mp4")
     
+    ffmpeg_headers = get_ffmpeg_headers(file_url)
+    
     ffmpeg_command = [
         'ffmpeg',
         '-y',               # Overwrite output file
+        *ffmpeg_headers,
         '-i', file_url,
         '-ss', str(start_time_seconds),
         '-t', str(duration_seconds),
@@ -265,7 +282,7 @@ def download_temp_gif(file_url):
         #ext = ".gifv" if file_url.endswith(".gifv") else ".gif"
         ext = ".gif"
         temp_file_path = os.path.join(TEMP_FOLDER, f"temp_gif_{uuid.uuid4()}{ext}")
-        response = requests.get(file_url, stream=True)
+        response = requests.get(file_url, headers=getBaseHeadersBySite(file_url), stream=True)
         response.raise_for_status()
         with open(temp_file_path, 'wb') as temp_file:
             for chunk in response.iter_content(chunk_size=8192):
@@ -351,9 +368,9 @@ def select_single_frame(file_url, extract_time_start_ms):
 
     is_gif = file_url.endswith(".gif")# or file_url.endswith(".gifv")
     if is_gif:
-        file_url = download_temp_gif(file_url)
+        temp_file_path = download_temp_gif(file_url)
         try:
-            img = Image.open(file_url)
+            img = Image.open(temp_file_path)
             # Calculate the target frame index
             # GIFs usually run at a fixed frame delay (often 100ms), 
             # but the best way is to accumulate delays.
@@ -380,13 +397,16 @@ def select_single_frame(file_url, extract_time_start_ms):
         finally:
             if img:
                 img.close()
-            if file_url:
-                os.unlink(file_url)
+            if temp_file_path:
+                os.unlink(temp_file_path)
         return t
+    
+    ffmpeg_headers = get_ffmpeg_headers(file_url)
     
     cmd = [
         "ffmpeg",
         "-ss", f"{extract_time_start_ms / 1000.0}",
+        *ffmpeg_headers,
         "-i", file_url,
         "-copyts",
         "-vframes", "1",
@@ -632,9 +652,30 @@ def extract_video_frames(file_url, extract_time_start_ms, extract_duration_range
     tensor_frames = ensure_length(tensor_frames, extract_N_frames)
     
     return torch.cat(tensor_frames, dim=0) # (N, H, W, C)
-    
+
+def get_ffmpeg_headers(siteOrUrl):
+    headers = getBaseHeadersBySite(siteOrUrl)
+    ffmpeg_headers = []
+    for k, v in headers.items():
+        ffmpeg_headers += ["-headers", f"{k}: {v}"]
+    return ffmpeg_headers
+
 # ------------------------
 
+def updateUserAgent(user_agent):
+    global USER_AGENT
+    USER_AGENT = user_agent.strip() if user_agent else _USER_AGENT_
+    return
+
+def getBaseHeadersBySite(siteOrUrl):
+    headers = {"User-Agent": USER_AGENT}
+    if "gelbooru" in siteOrUrl.lower():
+        headers.update(EXTRA_SITE_HEADERS["gelbooru"])
+    elif "danbooru" in siteOrUrl.lower():
+        headers.update(EXTRA_SITE_HEADERS["danbooru"])
+    elif "e621" in siteOrUrl.lower():
+        headers.update(EXTRA_SITE_HEADERS["e621"])
+    return headers
 
 def loadImageFromUrl(url):
     if url.startswith("data:image/"):
@@ -645,7 +686,7 @@ def loadImageFromUrl(url):
         obj = s3.get_object(Bucket=bucket, Key=key)
         i = Image.open(io.BytesIO(obj['Body'].read()))
     else:
-        response = requests.get(url, timeout=5)
+        response = requests.get(url, headers=getBaseHeadersBySite(url), timeout=5)
         if response.status_code != 200:
             raise Exception(response.text)
 
@@ -704,6 +745,9 @@ class SILVER_FL_BooruBrowser:
                 "danbooru_api_key": ("STRING", {"default": ""}),
                 "e621_user_id": ("STRING", {"default": ""}),
                 "e621_api_key": ("STRING", {"default": ""}),
+                
+                # API Security
+                "User_Agent": ("STRING", {"default": USER_AGENT}),
             },
             "optional": {
                 "selected_url": ("STRING", {"default": ""}),
@@ -729,8 +773,10 @@ Notes:
 
     def browse_booru(self, site, AND_tags, OR_tags, exclude_tags, limit, page, Safe, Questionable, Explicit, Order,
         select_random_result, VIDEO_audio_muted, thumbnail_size, thumbnail_quality, show_file_ext,
-        gelbooru_user_id, gelbooru_api_key, danbooru_user_id, danbooru_api_key, e621_user_id, e621_api_key, 
+        gelbooru_user_id, gelbooru_api_key, danbooru_user_id, danbooru_api_key, e621_user_id, e621_api_key, User_Agent,
         selected_url="", selected_img_tags="", current_time_ms=0):
+        
+        updateUserAgent(User_Agent)
         
         empty_img = torch.zeros(1,1,1,3)
         file_url = selected_url if not select_random_result else RANDOMLY_SELECTED_URL
@@ -739,6 +785,7 @@ Notes:
             
         try:
             is_video = isVideo(file_url)
+            img = empty_img
             if not is_video:
                 img, mask = loadImageFromUrl(file_url)
             else:
@@ -758,7 +805,7 @@ Notes:
     @classmethod
     def IS_CHANGED(cls, site, AND_tags, OR_tags, exclude_tags, limit, page, Safe, Questionable, Explicit, Order,
         select_random_result, VIDEO_audio_muted, thumbnail_size, thumbnail_quality, show_file_ext,
-        gelbooru_user_id, gelbooru_api_key, danbooru_user_id, danbooru_api_key, e621_user_id, e621_api_key, 
+        gelbooru_user_id, gelbooru_api_key, danbooru_user_id, danbooru_api_key, e621_user_id, e621_api_key, User_Agent,
         selected_url="", selected_img_tags="", current_time_ms=0):
         # Node is considered changed when a thumbnail selection modifies selected_url OR when select_random_result is True
         # comfyUI assumes the node is changed when the output of this function is different than the last time it ran
@@ -774,7 +821,7 @@ Notes:
     @classmethod
     def VALIDATE_INPUTS(cls, site, AND_tags, OR_tags, exclude_tags, limit, page, Safe, Questionable, Explicit, Order,
         select_random_result, VIDEO_audio_muted, thumbnail_size, thumbnail_quality, show_file_ext,
-        gelbooru_user_id, gelbooru_api_key, danbooru_user_id, danbooru_api_key, e621_user_id, e621_api_key, 
+        gelbooru_user_id, gelbooru_api_key, danbooru_user_id, danbooru_api_key, e621_user_id, e621_api_key, User_Agent,
         selected_url="", selected_img_tags="", current_time_ms=0):
         
         s = ""
@@ -889,6 +936,9 @@ async def api_booru_search(request):
         e621_user_id = data.get("e621_user_id", "")
         e621_api_key = data.get("e621_api_key", "")
         
+        User_Agent = data.get("User_Agent", USER_AGENT)
+        updateUserAgent(User_Agent)
+        
         # fix page by site if necessary
         if site == "Gelbooru":
             page -= 1 # Gelbooru API expects the fist page to be 0 but this node's minimum page value is 1
@@ -990,7 +1040,7 @@ async def api_booru_search(request):
         
         # Build request
         params = {}
-        headers = {"User-Agent": USER_AGENT}
+        headers = getBaseHeadersBySite(site)
         url = base_url
         
         if site == "Gelbooru":
@@ -1128,7 +1178,8 @@ async def api_booru_thumb(request):
             return web.json_response({"error": "No url provided"}, status=400)
         
         # Fetch image (timeout small)
-        headers = {"User-Agent": USER_AGENT}
+        headers = getBaseHeadersBySite(site)
+        
         resp = requests.get(url, timeout=8, stream=True, headers=headers)
         resp.raise_for_status()
         
@@ -1183,7 +1234,9 @@ async def api_video_stream(request):
                 pass
         
         range_header = request.headers.get("Range") # Forward range header if present
-        headers = {}
+        
+        headers = getBaseHeadersBySite(file_url)
+        
         if range_header:
             headers["Range"] = range_header
         
@@ -1195,6 +1248,8 @@ async def api_video_stream(request):
             response_headers = {
                 "Content-Type": resp.headers.get("Content-Type", "application/octet-stream"),
             }
+            response_headers.update(getBaseHeadersBySite(file_url))
+            
             # Pass through range-related headers
             for h in ["Content-Range", "Accept-Ranges", "Content-Length"]:
                 if h in resp.headers:
