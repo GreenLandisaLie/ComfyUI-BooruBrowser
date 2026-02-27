@@ -35,6 +35,8 @@ function addBooruBrowserUI(node) {
 	const e621_userWidget = node.widgets.find(w => w.name === "e621_user_id");
     const e621_apiWidget = node.widgets.find(w => w.name === "e621_api_key");
 	
+	const User_AgentWidget = node.widgets.find(w => w.name === "User_Agent");
+	
     // hidden
     const selectedUrlWidget = node.widgets.find(w => w.name === "selected_url");
     const selectedIMGTagsWidget = node.widgets.find(w => w.name === "selected_img_tags");
@@ -490,7 +492,7 @@ function addBooruBrowserUI(node) {
         scrollOffset = Math.max(0, Math.min(maxOffset, newOffset));
         node.setDirtyCanvas(true);
         return true;
-    };
+	};
 	
 	
     node.onMouseUp = function(event) {
@@ -570,7 +572,8 @@ function addBooruBrowserUI(node) {
 			danbooru_user_id: danbooru_userWidget ? danbooru_userWidget.value : "",
             danbooru_api_key: danbooru_apiWidget ? danbooru_apiWidget.value : "",
 			e621_user_id: e621_userWidget ? e621_userWidget.value : "",
-            e621_api_key: e621_apiWidget ? e621_apiWidget.value : ""
+            e621_api_key: e621_apiWidget ? e621_apiWidget.value : "",
+			User_Agent: User_AgentWidget ? User_AgentWidget.value : "",
         };
 
         try {
