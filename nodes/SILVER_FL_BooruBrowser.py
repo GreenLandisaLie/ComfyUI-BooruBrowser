@@ -12,6 +12,7 @@ import uuid
 from PIL import Image, ImageOps
 from typing import Optional, Dict, Any
 import torch
+import torchaudio
 import numpy as np
 import cv2
 import aiohttp
@@ -256,7 +257,8 @@ def download_temp_clip(file_url: str, extract_time_start_ms: int, extract_durati
         '-i', file_url,
         '-ss', str(start_time_seconds),
         '-t', str(duration_seconds),
-        '-an',              # No audio
+        #'-an',              # No audio
+        '-c:a', 'aac',
         '-c:v', 'libx264',  # Re-encode video stream
         '-preset', 'fast',  # Balance between speed and compression (e.g., 'veryfast', 'medium')
         '-crf', '18',       # Constant Rate Factor: 0=lossless, 51=worst quality. 23 is a good default.
@@ -429,8 +431,9 @@ def select_single_frame(file_url, extract_time_start_ms):
     
     return t
 
-def extract_video_frames(file_url, extract_time_start_ms, extract_duration_range_ms, extract_N_frames, frame_max_width, frame_max_height, filter_blurry_frames):
+def extract_video_frames_and_audio(file_url, extract_time_start_ms, extract_duration_range_ms, extract_N_frames, frame_max_width, frame_max_height, filter_blurry_frames):
     t = torch.zeros(1,1,1,3)
+    audio_output = {"waveform": torch.zeros((1, 1, 1)), "sample_rate": 44100}
     
     is_gif = file_url.endswith(".gif")
     if is_gif:
@@ -441,25 +444,32 @@ def extract_video_frames(file_url, extract_time_start_ms, extract_duration_range
             print(f"Failed to parse gif from url: {file_url}")
             if tmp_clip_path:
                 os.unlink(tmp_clip_path)
-            return t
+            return t, audio_output
     else:
         tmp_clip_path = download_temp_clip(file_url, extract_time_start_ms, extract_duration_range_ms)
     
     if not tmp_clip_path:
-        return t
+        return t, audio_output
+    
+    if not is_gif:
+        try:
+            waveform, sample_rate = torchaudio.load(tmp_clip_path)
+            audio_output = {"waveform": waveform.unsqueeze(0), "sample_rate": sample_rate}
+        except Exception as e:
+            print(f"Failed to extract audio: {e}")
     
     cap = cv2.VideoCapture(tmp_clip_path)
     if not cap.isOpened():
         os.unlink(tmp_clip_path)
         print("Failed to open temporary clipped video with OpenCV")
-        return t
+        return t, audio_output
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if total_frames <= 0:
         cap.release()
         os.unlink(tmp_clip_path)
         print("Clipped video has no frames")
-        return t
+        return t, audio_output
         
     _, required_rotation = get_video_duration_and_rotation(file_url)
     
@@ -650,8 +660,9 @@ def extract_video_frames(file_url, extract_time_start_ms, extract_duration_range
         return lst
         
     tensor_frames = ensure_length(tensor_frames, extract_N_frames)
+    tensor_frames = torch.cat(tensor_frames, dim=0) # (N, H, W, C)
     
-    return torch.cat(tensor_frames, dim=0) # (N, H, W, C)
+    return tensor_frames, audio_output
 
 def get_ffmpeg_headers(siteOrUrl):
     headers = getBaseHeadersBySite(siteOrUrl)
@@ -855,32 +866,33 @@ class SILVER_Online_Video_Frame_Extractor:
             }
         }
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("frames",)
+    RETURN_TYPES = ("IMAGE", "AUDIO",)
+    RETURN_NAMES = ("frames", "audio",)
     FUNCTION = "get_frames"
     CATEGORY = "Booru"
     DESCRIPTION = "EXPERIMENTAL"
 
     def get_frames(self, file_url, extract_time_start_ms, extract_duration_range_ms, extract_N_frames, frame_max_width, frame_max_height, filter_blurry_frames):
         empty_img = torch.zeros(1,1,1,3)
+        empty_audio = {"waveform": torch.zeros((1, 1, 1)), "sample_rate": 44100}
         if not file_url:
             print("[SILVER_Online_Video_Frame_Extractor] invalid file_url")
             return (empty_img,)
         try:
             if isVideo(file_url):
                 if FFMPEG_available:
-                    selected_frames = extract_video_frames(file_url, extract_time_start_ms, extract_duration_range_ms, extract_N_frames, frame_max_width, frame_max_height, filter_blurry_frames)
-                    return (selected_frames,)
+                    selected_frames, audio = extract_video_frames_and_audio(file_url, extract_time_start_ms, extract_duration_range_ms, extract_N_frames, frame_max_width, frame_max_height, filter_blurry_frames)
+                    return (selected_frames, audio,)
                 else:
                     print("[SILVER_Online_Video_Frame_Extractor] WARNING: FFMPEG not available! Output image will be blank.")
-                    return (empty_img,)
+                    return (empty_img, empty_audio,)
             else:
                 print("[SILVER_Online_Video_Frame_Extractor] file_url is not a video! Returning single image.")
                 img, mask = loadImageFromUrl(file_url)
-                return (img,)
+                return (img, empty_audio,)
         except Exception as e:
             print(f"[SILVER_Online_Video_Frame_Extractor] failed to extract frames from: {file_url}\nError: {e}")
-            return (empty_img,)
+            return (empty_img, empty_audio,)
 
 
 
