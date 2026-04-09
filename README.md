@@ -7,6 +7,9 @@ Created with the help of ChatGPT and Gemini
 UI based on the FL Load Image node (highly recommended) from https://github.com/filliptm/ComfyUI_Fill-Nodes
 
 # Changelog:
+- v3.4.0
+	- Added audio support for the online video extractor node
+
 - v3.3.0
 	- Fixed Gelbooru not working. (Gelbooru now demands HEADER 'Referer': 'https://gelbooru.com/' - even though its not documented anywhere -.-)
  	- Added additional input to control the 'User-Agent'. WARNING: for some reason Danbooru videos do not work when you change the User-Agent to something perfectly valid - like 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0'. Default works on everything for now: 'ComfyUI-BooruBrowser/1.0'
